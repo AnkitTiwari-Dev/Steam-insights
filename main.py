@@ -1,24 +1,28 @@
 import requests
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from dotenv import load_dotenv
 from datetime import datetime,timedelta
-
+from database import SessionLocal
+from sqlalchemy.orm import Session
+from models import Game
 app = FastAPI()
 load_dotenv()
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DEAL_API = os.getenv("DEAL_API")
 def get_owned(steam_id):
-    url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
-    params = {
-        "key" : STEAM_API_KEY,
-        "steamid" :steam_id,
-        "include_appinfo" : True,
-        "include_played_free_games" : True
-    }
-    response = requests.get(url,params=params)
-    response.raise_for_status()
-    return response.json()["response"]["games"]
+   
+   url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
+   params = {
+      "key" : STEAM_API_KEY,
+      "steamid" :steam_id,
+      "include_appinfo" : True,
+      "include_played_free_games" : True
+   }
+   response = requests.get(url,params=params)
+   response.raise_for_status()
+    
+   return response.json()["response"]["games"]
 @app.get("/library/{steam_id}")
 def get_games(steam_id:str):
    try:
@@ -44,10 +48,21 @@ def get_reviews(app_id:int):
       raise HTTPException(status_code=400, detail="Could not fetch reviews, check app ID")
    reviews = [review for review in rev_lst if review["author"]["playtime_forever"] > 1800]
    return{"app_id":app_id,"reviews":reviews}
+def get_db():
+   db = SessionLocal()
+   try:
+      yield db
+   finally:
+      db.close()
 
 @app.get("/last_sale/{app_id}")
-def get_last_sale(app_id:int):
+def get_last_sale(app_id:int,db : Session = Depends(get_db)):
+    cached_game = db.query(Game).filter(Game.app_id == app_id).first()
+    if cached_game and (datetime.now() - cached_game.last_checked < timedelta(hours=24)):
+       print("Using cache")
+       return{"app_id":app_id,"prices":cached_game.current_price,"next_sale":cached_game.last_sale_date}
     try:
+        print("retrieving")
         itad_id = lookup_ITAD_id(app_id)
         url = f"https://api.isthereanydeal.com/games/prices/v3"
         params = {
@@ -58,6 +73,7 @@ def get_last_sale(app_id:int):
         response = requests.post(url,params=params,json=[itad_id])
         response.raise_for_status()
         sale = response.json()
+        current_price = sale[0]["deals"][0]["price"]["amount"]
         hist = get_history(itad_id)
         average_gap = timedelta()
         for i in range(len(hist) - 1):
@@ -68,6 +84,14 @@ def get_last_sale(app_id:int):
     except Exception as e:
        print(e)
        raise HTTPException(status_code=400, detail="Could not fetch price, check app ID")
+    new_game = Game(app_id=app_id,
+                    itad_id=itad_id,
+                    last_checked=datetime.now(),
+                    current_price=current_price,
+                    average_gap_days=average_gap.total_seconds()/86400,
+                    last_sale_date=next_sale)
+    db.add(new_game)
+    db.commit()
     return{"app_id":app_id,"prices":sale,"next_sale":next_sale}
 
 def lookup_ITAD_id(app_id:int):
@@ -89,8 +113,10 @@ def get_history(Itad_id:str):
    }
    response = requests.get(url,params=params)
    response.raise_for_status()
-   cuts = response.json()
-   return [cut for cut in cuts if cut["deal"]["cut"] > 0]
+   history = response.json()
+   sales = [cut for cut in history if cut["deal"]["cut"] > 0]
+   sales.sort(key= lambda x: datetime.fromisoformat(x["timestamp"]),reverse=True)
+   return sales
 
 if __name__ == "__main__":
     print(get_history(lookup_ITAD_id(1091500)))
