@@ -104,13 +104,15 @@ def lookup_ITAD_id(app_id:int):
    response.raise_for_status()
    return response.json()["game"]["id"]
 
-def get_history(Itad_id:str):
+def get_history(Itad_id:str,since=None):
    url = f"https://api.isthereanydeal.com/games/history/v2"
    params = {
       "key":DEAL_API,
       "id":Itad_id,
-      "shops":61
+      "shops":61,
    }
+   if since:
+      params["since"] = since
    response = requests.get(url,params=params)
    response.raise_for_status()
    history = response.json()
@@ -119,4 +121,5 @@ def get_history(Itad_id:str):
    return sales
 
 if __name__ == "__main__":
-    print(get_history(lookup_ITAD_id(1091500)))
+    print(len(get_history(lookup_ITAD_id(1091500))))
+    print(len(get_history(lookup_ITAD_id(1091500), since="2020-01-01T00:00:00Z")))

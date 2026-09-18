@@ -13,3 +13,12 @@ class Game(Base):
     itad_id = Column(String,unique=True,nullable=True)
     last_checked = Column(DateTime)
 
+class SaleEvent(Base):
+    __tablename__ = "sale_events"
+    id = Column(Integer, primary_key=True)
+    regular_price = Column(Float)
+    timestamp = Column(DateTime)
+    cut = Column(Integer)
+    shop_id = Column(Integer)
+    app_id = Column(Integer)
+    
