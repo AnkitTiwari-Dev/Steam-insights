@@ -1,12 +1,16 @@
 import requests
 import os
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Depends
 from dotenv import load_dotenv
 from datetime import datetime,timedelta
 from database import SessionLocal
 from sqlalchemy.orm import Session
 from models import Game
+from features import days_to_nearest_sale, steam_sale_dates
+import joblib
 app = FastAPI()
+model = joblib.load("sale_prediction_model.joblib")  
 load_dotenv()
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DEAL_API = os.getenv("DEAL_API")
@@ -119,6 +123,39 @@ def get_history(Itad_id:str,since=None):
    sales = [cut for cut in history if cut["deal"]["cut"] > 0]
    sales.sort(key= lambda x: datetime.fromisoformat(x["timestamp"]),reverse=True)
    return sales
+def compute_features(app_id:int):
+   itad_id = lookup_ITAD_id(app_id)
+   hist = get_history(itad_id, since="2019-01-01T00:00:00Z")
+   num_sales = len(hist)
+   cuts = [event["deal"]["cut"] for event in hist]
+   avg_cut = sum(cuts)/len(cuts)
+   average_gap = timedelta()
+   if len(hist) < 2:
+      raise ValueError("Not enough history to compute prediction")
+   for i in range(len(hist) - 1):
+      gap = datetime.fromisoformat(hist[i]["timestamp"]) - datetime.fromisoformat(hist[i + 1]["timestamp"])
+      average_gap += gap
+   avg_gap_days = average_gap.total_seconds() / 86400 / (len(hist) - 1)
+
+   most_recent_timestamp = datetime.fromisoformat(hist[0]["timestamp"])
+   days_since_last_sale = (datetime.now(most_recent_timestamp.tzinfo) - most_recent_timestamp).total_seconds() / 86400
+
+   regular_price = hist[0]["deal"]["regular"]["amount"]
+   today = pd.Timestamp(datetime.now(), tz="UTC")
+   days_to_next_sale = days_to_nearest_sale(today, steam_sale_dates)
+   return [num_sales, avg_cut, avg_gap_days, regular_price, days_since_last_sale, days_to_next_sale]
+ 
+@app.get("/predict/{app_id}")
+def predict(app_id:int):
+   try:
+      
+      features = compute_features(app_id)
+      sale_prob = model.predict_proba([features])[0][1]
+   except Exception as e:
+      print(e)
+      raise HTTPException(status_code=400, detail="Could not compute prediction")
+   return {"app_id": app_id, "sale_probability": sale_prob}
+
 
 if __name__ == "__main__":
     print(len(get_history(lookup_ITAD_id(1091500))))
