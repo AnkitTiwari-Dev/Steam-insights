@@ -9,11 +9,19 @@ from sqlalchemy.orm import Session
 from models import Game
 from features import days_to_nearest_sale, steam_sale_dates
 import joblib
-app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
+
 model = joblib.load("sale_prediction_model.joblib")  
 load_dotenv()
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DEAL_API = os.getenv("DEAL_API")
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 def get_owned(steam_id):
    
    url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
