@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 
 function App() {
   const [steam_id, set_steam_id] = useState("");
@@ -7,6 +8,7 @@ function App() {
   const [sale_info, change_sale_info] = useState(null);
   const [prediction, set_prediction] = useState(null);
   const [reviews, set_reviews] = useState(null);
+  const [history, set_history] = useState(null);
 
   useEffect(() => {
     if (!selection) return;
@@ -23,6 +25,16 @@ function App() {
     set_prediction(data);
   }
 
+  async function fetchHistory() {
+    const response = await fetch(`http://127.0.0.1:8000/history/${selection.appid}`);
+    if (!response.ok) {
+      set_history(null);
+      return;
+  }
+    const data = await response.json();
+    set_history(data);
+  }
+
   async function fetchReviews() {
     const response = await fetch(`http://127.0.0.1:8000/reviews/${selection.appid}`);
     const data = await response.json();
@@ -32,6 +44,7 @@ function App() {
     fetchSale();
     fetchPrediction();
     fetchReviews();
+    fetchHistory();
   }, [selection]);
 
   async function lib_search() {
@@ -79,6 +92,17 @@ function App() {
                   <li key = {review.recommendationId}>{review.review}</li>
                 ))}
               </ul>
+            </div>
+          )}
+          {history && (
+            <div>
+              <h3>Discount history</h3>
+              <LineChart width={500} height={500} data={history}>
+                <XAxis dataKey="timestamp" tick={false}/>
+                <YAxis dataKey="cut"/>
+                <Tooltip/>
+                <Line type="monotone" dataKey="cut" stroke="#8884d8"/>
+              </LineChart>
             </div>
           )}
         </div>

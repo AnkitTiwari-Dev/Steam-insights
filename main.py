@@ -164,7 +164,25 @@ def predict(app_id:int):
       raise HTTPException(status_code=400, detail="Could not compute prediction")
    return {"app_id": app_id, "sale_probability": sale_prob}
 
+@app.get("/history/{app_id}")
+def get_price_history(app_id: int):
+    try:
+        itad_id = lookup_ITAD_id(app_id)
+        hist = get_history(itad_id, since="2019-01-01T00:00:00Z")
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=400, detail="Could not fetch price history")
+    return [
+        {
+            "timestamp": event["timestamp"],
+            "cut": event["deal"]["cut"],
+            "regular_price": event["deal"]["regular"]["amount"]
+        }
+        for event in hist
+    ]
+
+
 
 if __name__ == "__main__":
-    print(len(get_history(lookup_ITAD_id(1091500))))
-    print(len(get_history(lookup_ITAD_id(1091500), since="2020-01-01T00:00:00Z")))
+    print(lookup_ITAD_id(1687950))
+    print(get_history("018d937f-4adb-73a6-a9e5-94ff62f6265b", since="2019-01-01T00:00:00Z"))
