@@ -18,7 +18,7 @@ function App() {
     if (!selection) return;
 
     async function fetchSale() {
-      const response = await fetch(`${API_BASE}}/last_sale/${selection.appid}`);
+      const response = await fetch(`${API_BASE}/last_sale/${selection.appid}`);
       const data = await response.json();
       change_sale_info(data);
     }
@@ -127,49 +127,68 @@ function App() {
         )}
 
         {selection && (
-          <div>
-            <button onClick={() => set_selection(null)}>Back</button>
-            <h2>{selection.name}</h2>
+  <div className="detail-view">
+    <button className="back-button" onClick={() => set_selection(null)}>
+      ← Back
+    </button>
 
-            <div className="stat-grid">
-              {sale_info && (
-                <div className="stat-card">
-                  <p>Next sale estimate</p>
-                  <p>{new Date(sale_info.next_sale).toLocaleDateString()}</p>
-                </div>
-              )}
-              {prediction && (
-                <div className="stat-card">
-                  <p>Sale probability</p>
-                  <p>{(prediction.sale_probability * 100).toFixed(0)}%</p>
-                </div>
-              )}
+    <div className="detail-header">
+      <div
+        className="detail-cover"
+        style={{
+          backgroundImage: `url(https://cdn.akamai.steamstatic.com/steam/apps/${selection.appid}/library_600x900.jpg)`
+        }}
+      />
+      <div className="detail-header-text">
+        <h2>{selection.name}</h2>
+        <p className="detail-hours">{(selection.playtime_forever / 60).toFixed(1)} hours played</p>
+      </div>
+    </div>
+
+    <div className="stat-grid">
+      {sale_info && (
+        <div className="stat-card">
+          <p className="stat-label">Next sale estimate</p>
+          <p className="stat-value">{new Date(sale_info.next_sale).toLocaleDateString()}</p>
+        </div>
+      )}
+      {prediction && (
+        <div className="stat-card">
+          <p className="stat-label">Sale probability</p>
+          <p className="stat-value">{(prediction.sale_probability * 100).toFixed(0)}%</p>
+        </div>
+      )}
+    </div>
+
+    {history && (
+      <div className="detail-section">
+        <h3>Discount history</h3>
+        <LineChart width={600} height={260} data={[...history].reverse()}>
+          <XAxis dataKey="timestamp" tick={false} stroke="#2a2f3a" />
+          <YAxis dataKey="cut" tick={{ fill: "#8a8f98", fontSize: 12 }} stroke="#2a2f3a" />
+          <Tooltip
+            contentStyle={{ background: "#181b22", border: "1px solid #262a33", borderRadius: 8 }}
+            labelStyle={{ color: "#8a8f98" }}
+          />
+          <Line type="monotone" dataKey="cut" stroke="#e8a33d" strokeWidth={2} dot={false} />
+        </LineChart>
+      </div>
+    )}
+
+    {reviews && (
+      <div className="detail-section">
+        <h3>What experienced players think (30+ hours)</h3>
+        <div className="review-list">
+          {reviews.reviews.map((review, index) => (
+            <div className="review-card" key={index}>
+              <p>{review.review}</p>
             </div>
-
-            {reviews && (
-              <div>
-                <h3>What experienced players think (30+ hours)</h3>
-                <ul>
-                  {reviews.reviews.map((review, index) => (
-                    <li key={index}>{review.review}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {history && (
-              <div>
-                <h3>Discount history</h3>
-                <LineChart width={500} height={250} data={[...history].reverse()}>
-                  <XAxis dataKey="timestamp" tick={false} />
-                  <YAxis dataKey="cut" />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="cut" stroke="#8884d8" />
-                </LineChart>
-              </div>
-            )}
-          </div>
-        )}
+          ))}
+        </div>
+      </div>
+    )}
+  </div>
+)}
       </div>
     </div>
   );

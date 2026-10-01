@@ -24,14 +24,12 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
   color: #ffffff;
   width: 100%;
-  height: 100vh;            /* Forces the container to match full monitor height */
+  min-height: 100vh;    /* was height: 100vh */
   position: relative;
-  overflow: hidden;         /* Prevents random scrollbars */
-  
-  /* Flexbox system to anchor contents to dead center */
+  /* remove overflow: hidden entirely */
   display: flex;
-  align-items: center;      /* Dead center vertically */
-  justify-content: center;   /* Dead center horizontally */
+  flex-direction: column;
+  align-items: center;
   margin: 0;
   padding: 0;
 }
@@ -41,7 +39,6 @@ body {
   position: relative;
   z-index: 1;
   width: 100%;
-  max-width: 600px;         /* Tightened maximum container footprint */
   padding: 20px;
   margin: 0 auto;           /* Forces explicit centering calculation */
   
@@ -106,7 +103,7 @@ body {
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 14px;
   max-width: 900px;
-  margin: 30px auto 0;
+  margin: 30px auto 0;   /* back to auto centering */
   padding: 0;
   list-style: none;
 }
@@ -114,27 +111,44 @@ body {
 .game-card {
   background-color: #181b22;
   border: 1px solid #262a33;
-  border-radius: 12px;
+  border-radius: 10px;
   overflow: hidden;
   cursor: pointer;
   text-align: left;
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.game-card:hover{
+  transform: translateY(-4px);
+  border-color: #e8a33d;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
 }
 
 .game-cover {
   width: 100%;
-  aspect-ratio: 600/900;
+  aspect-ratio: 600 / 900;
   background-size: cover;
   background-position: center;
+  background-color: #20232b;
+  transition: transform 0.3s ease;
+  overflow: hidden;
+}
+
+.game-card:hover .game-cover {
+  transform: scale(1.04);
 }
 
 .game-info {
-  padding: 14px 16px;
+  padding: 12px 14px;
 }
 
 .game-info h4 {
   margin: 0 0 6px;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .game-stats-row {
@@ -168,4 +182,100 @@ body {
   padding: 16px;
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.detail-view {
+  width: 100%;
+  max-width: 700px;
+  margin: 20px auto 0;
+  text-align: left;
+}
+
+.back-button {
+  background: none;
+  border: 1px solid #262a33;
+  color: #8a8f98;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+
+.back-button:hover {
+  border-color: #e8a33d;
+  color: #e8a33d;
+}
+
+.detail-header {
+  display: flex;
+  gap: 20px;
+  align-items: flex-end;
+  margin-bottom: 24px;
+}
+
+.detail-cover {
+  width: 100px;
+  aspect-ratio: 600 / 900;
+  background-size: cover;
+  background-position: center;
+  background-color: #20232b;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.detail-header-text h2 {
+  margin: 0 0 4px;
+  font-size: 1.6rem;
+}
+
+.detail-hours {
+  margin: 0;
+  color: #8a8f98;
+  font-size: 0.9rem;
+}
+
+.stat-label {
+  margin: 0 0 6px;
+  font-size: 0.8rem;
+  color: #8a8f98;
+}
+
+.stat-value {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: #e8a33d;
+}
+
+.detail-section {
+  margin-top: 32px;
+}
+
+.detail-section h3 {
+  font-size: 1rem;
+  margin: 0 0 14px;
+  color: #eef0f2;
+}
+
+.review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.review-card {
+  background: #181b22;
+  border: 1px solid #262a33;
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.review-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: #c4c7cc;
 }
