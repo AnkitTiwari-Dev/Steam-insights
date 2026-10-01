@@ -18,7 +18,7 @@ DEAL_API = os.getenv("DEAL_API")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -66,6 +66,52 @@ def get_db():
       yield db
    finally:
       db.close()
+
+@app.get("/review_stats/{app_id}")
+def get_review_stats(app_id:int):
+   try:
+      url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
+      params = {
+        "filter" : "recent",
+        "num_per_page" : 100
+      }
+      response = requests.get(url,params=params)
+      response.raise_for_status()
+      rev_lst = response.json()["reviews"]
+   except:
+      raise HTTPException(status_code=400, detail="Could not fetch reviews, check app ID")
+   sections = {"<2":[0,0],"2-10":[0,0],"10-30":[0,0],"30-100":[0,0],"100+":[0,0]}
+   key = ""
+   for review in rev_lst:
+      playtime = review["author"]["playtime_forever"]/60
+      if playtime < 2:
+         key = "<2"
+      elif 2 <= playtime < 10:
+         key = "2-10"
+      elif 10 <= playtime < 30:
+         key = "10-30"
+      elif 30 <= playtime < 100:
+         key = "30-100"
+      else:
+         key = "100+"
+      sections[key][0] += 1
+      if review["voted_up"]:
+         sections[key][1] +=1
+
+   output = {}
+   for section, (total,recommended) in sections.items():
+      output[section] = round((recommended/total) * 100, 2) if total > 0 else None
+   total_rev = len(rev_lst)
+   total_recc = sum(1 for r in rev_lst if r["voted_up"])
+   overall_percent = round((total_recc/total_rev) * 100, 2) if total_rev > 0 else None
+
+   return{
+      "app_id":app_id,
+      "overall_percent":overall_percent,
+      "total_rev":total_rev,
+      "by_play":output
+   }
+   
 
 @app.get("/last_sale/{app_id}")
 def get_last_sale(app_id:int,db : Session = Depends(get_db)):
