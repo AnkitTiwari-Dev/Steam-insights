@@ -6,10 +6,17 @@ from dotenv import load_dotenv
 from datetime import datetime,timedelta
 from database import SessionLocal
 from sqlalchemy.orm import Session
-from models import Game
+from models import Game, Rating
 from features import days_to_nearest_sale, steam_sale_dates
 import joblib
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+class RatingInput(BaseModel):
+    app_id: int
+    steam_id: str
+    status: str
+    score: int | None = None
 
 model = joblib.load("sale_prediction_model.joblib")  
 load_dotenv()
@@ -18,7 +25,7 @@ DEAL_API = os.getenv("DEAL_API")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "https://steam-insights.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,6 +42,9 @@ def get_owned(steam_id):
    response.raise_for_status()
     
    return response.json()["response"]["games"]
+
+
+
 @app.get("/library/{steam_id}")
 def get_games(steam_id:str):
    try:
@@ -66,6 +76,38 @@ def get_db():
       yield db
    finally:
       db.close()
+@app.post("/rating")
+def set_rating(pl:RatingInput,db:Session = Depends(get_db)):
+   if pl.status not in {"skip it","timepass","go for it","perfection"}:
+      raise HTTPException(status_code=400, detail="status must be want, own, or played")
+   if pl.score is not None and not(1 <= pl.score <= 10):
+      raise HTTPException(status_code=400, detail="score must be between 1 and 10")
+   
+   existing = (
+        db.query(Rating)
+        .filter(Rating.app_id == pl.app_id, Rating.steam_id == pl.steam_id)
+        .first()
+   )
+   if existing:
+      existing.status = pl.status
+      existing.score = pl.score
+      db.commit()
+      db.refresh(existing)
+      return existing
+   new_rating = Rating(
+      app_id = pl.app_id,
+      score = pl.score,
+      status = pl.status,
+      steam_id = pl.steam_id
+   )
+   db.add(new_rating)
+   db.commit()
+   db.refresh(new_rating)
+   return new_rating
+@app.get("/rating/{steam_id}")
+def get_ratings(steam_id: str, db: Session = Depends(get_db)):
+    ratings = db.query(Rating).filter(Rating.steam_id == steam_id).all()
+    return {r.app_id: {"status": r.status, "score": r.score} for r in ratings}
 
 @app.get("/review_stats/{app_id}")
 def get_review_stats(app_id:int):

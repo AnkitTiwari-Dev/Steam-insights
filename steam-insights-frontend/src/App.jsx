@@ -2,9 +2,11 @@ import { useState, useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, ThumbsUp } from "lucide-react";
 import "./App.css";
+import RatingWidget from "./RatingWidget";
 const API_BASE = "https://playstats.onrender.com";
 
 function App() {
+  const [user_ratings, set_user_ratings] = useState({});
   const [steam_id, set_steam_id] = useState("");
   const [library, set_library] = useState(null);
   const [selection, set_selection] = useState(null);
@@ -23,6 +25,11 @@ function App() {
       change_sale_info(data);
     }
 
+    async function fetchRating(){
+      const response = await fetch(`${API_BASE}/ratings/${steam_id}`);
+      const data = await response.json();
+      set_user_ratings(data);
+    }
     async function fetchPrediction() {
       const response = await fetch(`${API_BASE}/predict/${selection.appid}`);
       const data = await response.json();
@@ -49,6 +56,7 @@ function App() {
     fetchPrediction();
     fetchReviews();
     fetchHistory();
+    fetchRating();
   }, [selection]);
 
   useEffect(() => {
@@ -141,6 +149,12 @@ function App() {
       />
       <div className="detail-header-text">
         <h2>{selection.name}</h2>
+          <RatingWidget
+          appId={selection.appid}
+          steamId={steam_id}
+          initialStatus={user_ratings[selection.appid]?.status}
+          initialScore={user_ratings[selection.appid]?.score}
+          />
         <p className="detail-hours">{(selection.playtime_forever / 60).toFixed(1)} hours played</p>
       </div>
     </div>
