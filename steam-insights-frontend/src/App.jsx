@@ -26,7 +26,7 @@ function App() {
     }
 
     async function fetchRating(){
-      const response = await fetch(`${API_BASE}/ratings/${steam_id}`);
+      const response = await fetch(`${API_BASE}/rating/${steam_id}`);
       const data = await response.json();
       set_user_ratings(data);
     }
