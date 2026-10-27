@@ -7,7 +7,7 @@ const API_BASE = "https://playstats.onrender.com";
 
 function App() {
   const [user_ratings, set_user_ratings] = useState({});
-  const [steam_id, set_steam_id] = useState("76561197960434622");
+  const [steam_id, set_steam_id] = useState("76561199570092491");
   const [library, set_library] = useState(null);
   const [selection, set_selection] = useState(null);
   const [sale_info, change_sale_info] = useState(null);
