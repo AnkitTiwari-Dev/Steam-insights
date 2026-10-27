@@ -7,7 +7,7 @@ const API_BASE = "https://playstats.onrender.com";
 
 function App() {
   const [user_ratings, set_user_ratings] = useState({});
-  const [steam_id, set_steam_id] = useState("");
+  const [steam_id, set_steam_id] = useState("76561197960434622");
   const [library, set_library] = useState(null);
   const [selection, set_selection] = useState(null);
   const [sale_info, change_sale_info] = useState(null);
@@ -60,21 +60,37 @@ function App() {
   }, [selection]);
 
   useEffect(() => {
-    if (!library) return;
+  if (!library) return;
 
-    async function fetchAllRecommendations() {
-      const results = await Promise.all(
-        library.games.map(async (game) => {
+  async function fetchAllRecommendations() {
+    const CONCURRENCY_LIMIT = 8;
+    const games = library.games;
+    const results = {};
+    let index = 0;
+
+    async function worker() {
+      while (index < games.length) {
+        const game = games[index];
+        index++;
+        try {
           const response = await fetch(`${API_BASE}/review_stats/${game.appid}`);
-          const data = await response.json();
-          return [game.appid, data.overall_percent];
-        })
-      );
-      set_recommend_data(Object.fromEntries(results));
+          if (response.ok) {
+            const data = await response.json();
+            results[game.appid] = data.overall_percent;
+          }
+        } catch (e) {
+          console.error(`Failed to fetch review stats for ${game.appid}`, e);
+        }
+      }
     }
 
-    fetchAllRecommendations();
-  }, [library]);
+    const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
+    await Promise.all(workers);
+    set_recommend_data(results);
+  }
+
+  fetchAllRecommendations();
+}, [library]);
 
   async function lib_search() {
     const response = await fetch(`${API_BASE}/library/${steam_id}`);
