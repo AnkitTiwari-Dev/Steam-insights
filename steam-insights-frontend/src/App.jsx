@@ -3,7 +3,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, ThumbsUp } from "lucide-react";
 import "./App.css";
 import RatingWidget from "./RatingWidget";
-import AskBox from "./askbox";
+import AskBox from "./AskBox";
 
 // To test against a local backend, create .env.local with:
 //   VITE_API_URL=http://localhost:8000
