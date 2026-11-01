@@ -1,0 +1,86 @@
+/* Append to App.css */
+
+.ask-box {
+  width: 100%;
+  max-width: 640px;
+  margin: 24px auto;
+  padding: 16px;
+  background: #181b22;
+  border: 1px solid #262a33;
+  border-radius: 8px;
+  text-align: left;
+}
+
+.ask-box h3 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: #c7d5e0;
+}
+
+.ask-form {
+  display: flex;
+  gap: 8px;
+}
+
+.ask-form input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ask-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ask-example {
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  color: #c7d5e0;
+  background: transparent;
+  border: 1px solid #262a33;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.ask-example:hover,
+.ask-example:focus-visible {
+  border-color: #e8a33d;
+  outline: none;
+}
+
+.ask-status {
+  margin: 12px 0 0;
+  color: #8a8f98;
+}
+
+.ask-error {
+  margin: 12px 0 0;
+  color: #e8a33d;
+}
+
+.ask-answer {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #262a33;
+  color: #c7d5e0;
+  line-height: 1.5;
+}
+
+.ask-answer p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.ask-answer .ask-sources {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: #8a8f98;
+}
+
+@media (max-width: 480px) {
+  .ask-form {
+    flex-direction: column;
+  }
+}

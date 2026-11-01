@@ -3,6 +3,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, ThumbsUp } from "lucide-react";
 import "./App.css";
 import RatingWidget from "./RatingWidget";
+import AskBox from "./AskBox";
 
 // To test against a local backend, create .env.local with:
 //   VITE_API_URL=http://localhost:8000
@@ -175,7 +176,9 @@ function App() {
               </p>
             )}
             {search_error && <p style={{ color: "#e8a33d" }}>{search_error}</p>}
-
+               {library?.games && (
+     <AskBox apiBase={API_BASE} steamId={steam_id.trim()} />
+   )}
             {library?.games && (
               <ul className="game-list">
                 {library.games.map((game) => (

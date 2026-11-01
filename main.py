@@ -1,7 +1,7 @@
 import logging
 import os
 from datetime import datetime, timedelta
-
+from agent import run_agent
 import joblib
 import pandas as pd
 import requests
@@ -395,3 +395,46 @@ def get_community_rating(app_id: int, db: Session = Depends(get_db)):
         "total_votes": sum(counts.values()),
         "counts": counts,
     }
+
+from agent import run_agent
+
+class AskInput(BaseModel):
+    steam_id: str
+    question: str
+
+@app.post("/ask")
+def ask(payload: AskInput):
+    if not valid_steam_id(payload.steam_id):
+        raise HTTPException(status_code=400, detail="Steam ID must be 17 digits")
+
+    def library_tool(_):
+        games = get_owned(payload.steam_id) or []
+        games = sorted(games, key=lambda g: g.get("playtime_forever", 0), reverse=True)[:25]
+        return [{"name": g["name"], "app_id": g["appid"],
+                 "hours": round(g.get("playtime_forever", 0) / 60, 1)} for g in games]
+
+    def sale_tool(args):
+        app_id = int(args["app_id"])
+        db = SessionLocal()
+        try:
+            sale = get_last_sale(app_id, db)
+        finally:
+            db.close()
+        pred = predict(app_id)
+        return {"sale_probability": pred["sale_probability"],
+                "current_price": sale["prices"], "next_sale": sale["next_sale"]}
+
+    def review_tool(args):
+        db = SessionLocal()
+        try:
+            r = get_review_stats(int(args["app_id"]), db)
+        finally:
+            db.close()
+        return {"percent_positive": r["overall_percent"]}
+
+    return run_agent(payload.question, {
+        "get_library": library_tool,
+        "get_sale_prediction": sale_tool,
+        "get_review_summary": review_tool,
+    })
+
