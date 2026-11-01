@@ -1,17 +1,20 @@
 import logging
 import os
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta
-from agent import run_agent
+
 import joblib
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from agent import run_agent
 from database import SessionLocal
 from features import days_to_nearest_sale, steam_sale_dates
 from models import Game, Rating
@@ -24,10 +27,19 @@ STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DEAL_API = os.getenv("DEAL_API")
 REQUEST_TIMEOUT = 10  # seconds; stops a slow upstream API from hanging a request
 
+# Steam sometimes returns an empty body to requests without a browser-like User-Agent
+STEAM_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; playstat/1.0)"}
+
+# Allowed browser origins. Set FRONTEND_ORIGIN on Render to your deployed frontend URL
+# (e.g. https://playstat.vercel.app) if it isn't already in this list.
+ALLOWED_ORIGINS = ["http://localhost:5173", "https://steam-insights.vercel.app"]
+if os.getenv("FRONTEND_ORIGIN"):
+    ALLOWED_ORIGINS.append(os.getenv("FRONTEND_ORIGIN"))
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://steam-insights.vercel.app"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -81,6 +93,24 @@ def get_owned(steam_id):
     return response.json().get("response", {}).get("games")
 
 
+def fetch_steam_reviews(app_id, review_filter="recent", retries=2):
+    """Returns the list of reviews. Retries when Steam sends an empty or non-JSON body."""
+    url = f"https://store.steampowered.com/appreviews/{app_id}"
+    params = {"json": 1, "filter": review_filter, "num_per_page": 100}
+    for attempt in range(retries + 1):
+        response = requests.get(url, params=params, headers=STEAM_HEADERS, timeout=REQUEST_TIMEOUT)
+        try:
+            return response.json().get("reviews", [])
+        except ValueError:
+            logger.warning(
+                "Steam sent non-JSON for %s (status %s, attempt %s): %r",
+                app_id, response.status_code, attempt + 1, response.text[:100],
+            )
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise ValueError(f"Steam returned no JSON for {app_id}")
+
+
 @app.get("/library/{steam_id}")
 def get_games(steam_id: str):
     if not valid_steam_id(steam_id):
@@ -102,15 +132,11 @@ def get_games(steam_id: str):
 @app.get("/reviews/{app_id}")
 def get_reviews(app_id: int):
     try:
-        url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
-        params = {"filter": "all", "num_per_page": 100}
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        rev_lst = response.json().get("reviews", [])
+        rev_lst = fetch_steam_reviews(app_id, review_filter="all")
     except (requests.RequestException, ValueError):
         logger.exception("reviews fetch failed for %s", app_id)
         raise HTTPException(status_code=502, detail="Could not fetch reviews")
-    reviews = [r for r in rev_lst if r.get("author", {}).get("playtime_forever", 0) > 1800]
+    reviews = [r for r in rev_lst if (r.get("author") or {}).get("playtime_forever", 0) > 1800]
     return {"app_id": app_id, "reviews": reviews}
 
 
@@ -127,18 +153,15 @@ def get_review_stats(app_id: int, db: Session = Depends(get_db)):
         }
 
     try:
-        url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
-        params = {"filter": "recent", "num_per_page": 100}
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        rev_lst = response.json().get("reviews", [])
+        rev_lst = fetch_steam_reviews(app_id)
     except (requests.RequestException, ValueError):
         logger.exception("review_stats failed for %s", app_id)
         raise HTTPException(status_code=502, detail="Could not fetch reviews")
 
     sections = {"<2": [0, 0], "2-10": [0, 0], "10-30": [0, 0], "30-100": [0, 0], "100+": [0, 0]}
     for review in rev_lst:
-        playtime = review["author"]["playtime_forever"] / 60
+        author = review.get("author") or {}
+        playtime = author.get("playtime_forever", 0) / 60
         if playtime < 2:
             key = "<2"
         elif playtime < 10:
@@ -150,14 +173,14 @@ def get_review_stats(app_id: int, db: Session = Depends(get_db)):
         else:
             key = "100+"
         sections[key][0] += 1
-        if review["voted_up"]:
+        if review.get("voted_up"):
             sections[key][1] += 1
 
     output = {}
     for section, (total, recommended) in sections.items():
         output[section] = round((recommended / total) * 100, 2) if total > 0 else None
     total_rev = len(rev_lst)
-    total_recc = sum(1 for r in rev_lst if r["voted_up"])
+    total_recc = sum(1 for r in rev_lst if r.get("voted_up"))
     overall_percent = round((total_recc / total_rev) * 100, 2) if total_rev > 0 else None
 
     # A cache-write failure should never break the response
@@ -396,22 +419,60 @@ def get_community_rating(app_id: int, db: Session = Depends(get_db)):
         "counts": counts,
     }
 
-from agent import run_agent
+
+# --- AI assistant ---
+
+ASK_LIMIT = 10          # questions allowed per IP...
+ASK_WINDOW = 60 * 60    # ...per hour (in-memory, resets when the server restarts)
+MAX_QUESTION_CHARS = 300
+LIBRARY_TOOL_GAMES = 25  # how many top games get_library returns to the model
+
+_ask_hits = defaultdict(list)
+
+
+def check_ask_rate_limit(request: Request):
+    """Simple per-IP limit so a public /ask can't run up the Anthropic bill."""
+    forwarded = request.headers.get("x-forwarded-for")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    now = time.time()
+    hits = [t for t in _ask_hits[ip] if now - t < ASK_WINDOW]
+    if len(hits) >= ASK_LIMIT:
+        _ask_hits[ip] = hits
+        raise HTTPException(status_code=429, detail="Too many questions. Please try again later.")
+    hits.append(now)
+    _ask_hits[ip] = hits
+
 
 class AskInput(BaseModel):
     steam_id: str
     question: str
 
+
 @app.post("/ask")
-def ask(payload: AskInput):
+def ask(payload: AskInput, request: Request):
+    # Plain `def`: run_agent is synchronous, so FastAPI runs this in a threadpool.
     if not valid_steam_id(payload.steam_id):
         raise HTTPException(status_code=400, detail="Steam ID must be 17 digits")
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question can't be empty")
+    if len(question) > MAX_QUESTION_CHARS:
+        raise HTTPException(status_code=400, detail=f"Question must be under {MAX_QUESTION_CHARS} characters")
+    check_ask_rate_limit(request)
 
-    def library_tool(_):
-        games = get_owned(payload.steam_id) or []
-        games = sorted(games, key=lambda g: g.get("playtime_forever", 0), reverse=True)[:25]
-        return [{"name": g["name"], "app_id": g["appid"],
-                 "hours": round(g.get("playtime_forever", 0) / 60, 1)} for g in games]
+    steam_id = payload.steam_id  # comes from the request, never from model output
+
+    def library_tool(_args):
+        games = get_owned(steam_id) or []
+        games = sorted(games, key=lambda g: g.get("playtime_forever", 0), reverse=True)
+        return [
+            {
+                "name": g.get("name"),
+                "app_id": g["appid"],
+                "hours": round(g.get("playtime_forever", 0) / 60, 1),
+            }
+            for g in games[:LIBRARY_TOOL_GAMES]
+        ]
 
     def sale_tool(args):
         app_id = int(args["app_id"])
@@ -421,20 +482,27 @@ def ask(payload: AskInput):
         finally:
             db.close()
         pred = predict(app_id)
-        return {"sale_probability": pred["sale_probability"],
-                "current_price": sale["prices"], "next_sale": sale["next_sale"]}
+        return {
+            "sale_probability": pred["sale_probability"],
+            "current_price": sale["prices"],
+            "next_sale": sale["next_sale"],
+        }
 
     def review_tool(args):
+        app_id = int(args["app_id"])
         db = SessionLocal()
         try:
-            r = get_review_stats(int(args["app_id"]), db)
+            stats = get_review_stats(app_id, db)
         finally:
             db.close()
-        return {"percent_positive": r["overall_percent"]}
+        return {"percent_positive": stats["overall_percent"]}
 
-    return run_agent(payload.question, {
-        "get_library": library_tool,
-        "get_sale_prediction": sale_tool,
-        "get_review_summary": review_tool,
-    })
-
+    try:
+        return run_agent(question, {
+            "get_library": library_tool,
+            "get_sale_prediction": sale_tool,
+            "get_review_summary": review_tool,
+        })
+    except Exception:
+        logger.exception("ask failed for %s", steam_id)
+        raise HTTPException(status_code=502, detail="The assistant is unavailable, please try again")
