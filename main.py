@@ -1,22 +1,29 @@
-import requests
+import logging
 import os
-import pandas as pd
-from fastapi import FastAPI, HTTPException, Depends
-from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from database import SessionLocal
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from models import Game, Rating
-from features import days_to_nearest_sale, steam_sale_dates
-from pydantic import BaseModel
+
 import joblib
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from database import SessionLocal
+from features import days_to_nearest_sale, steam_sale_dates
+from models import Game, Rating
+
+logger = logging.getLogger("steam_insights")
 
 model = joblib.load("sale_prediction_model.joblib")
 load_dotenv()
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DEAL_API = os.getenv("DEAL_API")
+REQUEST_TIMEOUT = 10  # seconds; stops a slow upstream API from hanging a request
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -26,45 +33,7 @@ app.add_middleware(
 )
 
 
-def get_owned(steam_id):
-    url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
-    params = {
-        "key": STEAM_API_KEY,
-        "steamid": steam_id,
-        "include_appinfo": True,
-        "include_played_free_games": True
-    }
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    return response.json()["response"]["games"]
-
-
-@app.get("/library/{steam_id}")
-def get_games(steam_id: str):
-    try:
-        games = get_owned(steam_id)
-    except:
-        raise HTTPException(status_code=400, detail="Could not fetch games, check steam ID and profile privacy")
-    sort_games = sorted(games, key=lambda g: g["playtime_forever"], reverse=True)
-    return {"steam_id": steam_id, "games": sort_games}
-
-
-@app.get("/reviews/{app_id}")
-def get_reviews(app_id: int):
-    try:
-        url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
-        params = {
-            "filter": "all",
-            "num_per_page": 100
-        }
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        rev_lst = response.json()["reviews"]
-    except:
-        raise HTTPException(status_code=400, detail="Could not fetch reviews, check app ID")
-    reviews = [review for review in rev_lst if review["author"]["playtime_forever"] > 1800]
-    return {"app_id": app_id, "reviews": reviews}
-
+# ---------- helpers ----------
 
 def get_db():
     db = SessionLocal()
@@ -74,37 +43,109 @@ def get_db():
         db.close()
 
 
+def is_fresh(timestamp, hours=24):
+    """True if timestamp is within `hours` of now. Works for naive and tz-aware values."""
+    if timestamp is None:
+        return False
+    now = datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
+    return now - timestamp < timedelta(hours=hours)
+
+
+def valid_steam_id(steam_id: str) -> bool:
+    return steam_id.isdigit() and len(steam_id) == 17
+
+
+def average_gap_days(hist):
+    """Average days between consecutive sales (hist is newest-first). None if < 2 sales."""
+    if len(hist) < 2:
+        return None
+    total = timedelta()
+    for newer, older in zip(hist, hist[1:]):
+        total += datetime.fromisoformat(newer["timestamp"]) - datetime.fromisoformat(older["timestamp"])
+    return total.total_seconds() / 86400 / (len(hist) - 1)
+
+
+# ---------- Steam ----------
+
+def get_owned(steam_id):
+    url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
+    params = {
+        "key": STEAM_API_KEY,
+        "steamid": steam_id,
+        "include_appinfo": True,
+        "include_played_free_games": True,
+    }
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    # Private profiles come back as {"response": {}} with no "games" key
+    return response.json().get("response", {}).get("games")
+
+
+@app.get("/library/{steam_id}")
+def get_games(steam_id: str):
+    if not valid_steam_id(steam_id):
+        raise HTTPException(status_code=400, detail="Steam ID must be 17 digits")
+    try:
+        games = get_owned(steam_id)
+    except requests.RequestException:
+        logger.exception("library fetch failed for %s", steam_id)
+        raise HTTPException(status_code=502, detail="Steam request failed, please try again")
+    if not games:
+        raise HTTPException(
+            status_code=404,
+            detail="No games found. Check the Steam ID and that game details are public",
+        )
+    sort_games = sorted(games, key=lambda g: g.get("playtime_forever", 0), reverse=True)
+    return {"steam_id": steam_id, "games": sort_games}
+
+
+@app.get("/reviews/{app_id}")
+def get_reviews(app_id: int):
+    try:
+        url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
+        params = {"filter": "all", "num_per_page": 100}
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        rev_lst = response.json().get("reviews", [])
+    except (requests.RequestException, ValueError):
+        logger.exception("reviews fetch failed for %s", app_id)
+        raise HTTPException(status_code=502, detail="Could not fetch reviews")
+    reviews = [r for r in rev_lst if r.get("author", {}).get("playtime_forever", 0) > 1800]
+    return {"app_id": app_id, "reviews": reviews}
+
+
 @app.get("/review_stats/{app_id}")
 def get_review_stats(app_id: int, db: Session = Depends(get_db)):
-    # --- Cache check first: skip Steam entirely if we checked this game recently ---
+    # Cache hit: same keys as a fresh response, with None where we don't store the detail
     cached_game = db.query(Game).filter(Game.app_id == app_id).first()
-    if cached_game and cached_game.review_checked and (datetime.now() - cached_game.review_checked < timedelta(hours=24)):
-        return {"app_id": app_id, "overall_percent": cached_game.review_overall_percent}
+    if cached_game and is_fresh(cached_game.review_checked):
+        return {
+            "app_id": app_id,
+            "overall_percent": cached_game.review_overall_percent,
+            "total_rev": None,
+            "by_play": None,
+        }
 
     try:
         url = f"https://store.steampowered.com/appreviews/{app_id}?json=1"
-        params = {
-            "filter": "recent",
-            "num_per_page": 100
-        }
-        response = requests.get(url, params=params)
+        params = {"filter": "recent", "num_per_page": 100}
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        rev_lst = response.json()["reviews"]
-    except Exception as e:
-      print(f"review_stats failed for {app_id}: {type(e).__name__}: {e}")
-      raise HTTPException(status_code=400, detail="Could not fetch reviews, check app ID")
+        rev_lst = response.json().get("reviews", [])
+    except (requests.RequestException, ValueError):
+        logger.exception("review_stats failed for %s", app_id)
+        raise HTTPException(status_code=502, detail="Could not fetch reviews")
 
     sections = {"<2": [0, 0], "2-10": [0, 0], "10-30": [0, 0], "30-100": [0, 0], "100+": [0, 0]}
-    key = ""
     for review in rev_lst:
         playtime = review["author"]["playtime_forever"] / 60
         if playtime < 2:
             key = "<2"
-        elif 2 <= playtime < 10:
+        elif playtime < 10:
             key = "2-10"
-        elif 10 <= playtime < 30:
+        elif playtime < 30:
             key = "10-30"
-        elif 30 <= playtime < 100:
+        elif playtime < 100:
             key = "30-100"
         else:
             key = "100+"
@@ -119,95 +160,45 @@ def get_review_stats(app_id: int, db: Session = Depends(get_db)):
     total_recc = sum(1 for r in rev_lst if r["voted_up"])
     overall_percent = round((total_recc / total_rev) * 100, 2) if total_rev > 0 else None
 
-    # --- Write the result back to the cache ---
-    if cached_game:
-        cached_game.review_overall_percent = overall_percent
-        cached_game.review_checked = datetime.now()
-    else:
-        cached_game = Game(app_id=app_id, review_overall_percent=overall_percent, review_checked=datetime.now())
-        db.add(cached_game)
-    db.commit()
+    # A cache-write failure should never break the response
+    try:
+        if cached_game:
+            cached_game.review_overall_percent = overall_percent
+            cached_game.review_checked = datetime.now()
+        else:
+            db.add(Game(app_id=app_id, review_overall_percent=overall_percent, review_checked=datetime.now()))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("could not cache review stats for %s", app_id)
 
     return {
         "app_id": app_id,
         "overall_percent": overall_percent,
         "total_rev": total_rev,
-        "by_play": output
+        "by_play": output,
     }
 
 
-@app.get("/last_sale/{app_id}")
-def get_last_sale(app_id: int, db: Session = Depends(get_db)):
-    cached_game = db.query(Game).filter(Game.app_id == app_id).first()
-    if cached_game and cached_game.last_checked and (datetime.now() - cached_game.last_checked < timedelta(hours=24)):
-        print("Using cache")
-        return {"app_id": app_id, "prices": cached_game.current_price, "next_sale": cached_game.last_sale_date}
-    try:
-        print("retrieving")
-        itad_id = lookup_ITAD_id(app_id)
-        url = f"https://api.isthereanydeal.com/games/prices/v3"
-        params = {
-            "key": DEAL_API,
-            "deals": True,
-            "vouchers": True
-        }
-        response = requests.post(url, params=params, json=[itad_id])
-        response.raise_for_status()
-        sale = response.json()
-        current_price = sale[0]["deals"][0]["price"]["amount"]
-        hist = get_history(itad_id)
-        average_gap = timedelta()
-        for i in range(len(hist) - 1):
-            sale_gap = datetime.fromisoformat(hist[i]["timestamp"]) - datetime.fromisoformat(hist[i + 1]["timestamp"])
-            average_gap += sale_gap
-        average_gap /= (len(hist) - 1)
-        next_sale = datetime.now() + average_gap
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=400, detail="Could not fetch price, check app ID")
-
-    # --- Reuse the same cached row if review_stats already created one for this app_id ---
-    if cached_game:
-        cached_game.itad_id = itad_id
-        cached_game.last_checked = datetime.now()
-        cached_game.current_price = current_price
-        cached_game.average_gap_days = average_gap.total_seconds() / 86400
-        cached_game.last_sale_date = next_sale
-    else:
-        cached_game = Game(
-            app_id=app_id,
-            itad_id=itad_id,
-            last_checked=datetime.now(),
-            current_price=current_price,
-            average_gap_days=average_gap.total_seconds() / 86400,
-            last_sale_date=next_sale
-        )
-        db.add(cached_game)
-    db.commit()
-    return {"app_id": app_id, "prices": sale, "next_sale": next_sale}
-
+# ---------- IsThereAnyDeal ----------
 
 def lookup_ITAD_id(app_id: int):
-    url = f"https://api.isthereanydeal.com/games/lookup/v1"
-    params = {
-        "key": DEAL_API,
-        "appid": app_id
-    }
-    response = requests.get(url, params=params)
+    """Returns the ITAD id, or None if ITAD doesn't know this game."""
+    url = "https://api.isthereanydeal.com/games/lookup/v1"
+    params = {"key": DEAL_API, "appid": app_id}
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
-    return response.json()["game"]["id"]
+    data = response.json()
+    game = data.get("game") if data.get("found", True) else None
+    return game["id"] if game else None
 
 
-def get_history(Itad_id: str, since=None):
-    url = f"https://api.isthereanydeal.com/games/history/v2"
-    params = {
-        "key": DEAL_API,
-        "id": Itad_id,
-        "shops": 61,
-    }
+def get_history(itad_id: str, since=None):
+    url = "https://api.isthereanydeal.com/games/history/v2"
+    params = {"key": DEAL_API, "id": itad_id, "shops": 61}
     if since:
         params["since"] = since
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     history = response.json()
     sales = [cut for cut in history if cut["deal"]["cut"] > 0]
@@ -215,22 +206,82 @@ def get_history(Itad_id: str, since=None):
     return sales
 
 
+def get_current_price(itad_id: str):
+    """Current best price, or None if there is no active deal data."""
+    url = "https://api.isthereanydeal.com/games/prices/v3"
+    params = {"key": DEAL_API, "deals": True, "vouchers": True}
+    response = requests.post(url, params=params, json=[itad_id], timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    sale = response.json()
+    if not sale or not sale[0].get("deals"):
+        return None
+    return sale[0]["deals"][0]["price"]["amount"]
+
+
+@app.get("/last_sale/{app_id}")
+def get_last_sale(app_id: int, db: Session = Depends(get_db)):
+    # Always returns {"app_id", "prices": number|None, "next_sale": datetime|None},
+    # for both cache hits and fresh lookups (previously these had different shapes).
+    cached_game = db.query(Game).filter(Game.app_id == app_id).first()
+    if cached_game and is_fresh(cached_game.last_checked):
+        return {"app_id": app_id, "prices": cached_game.current_price, "next_sale": cached_game.last_sale_date}
+
+    try:
+        itad_id = lookup_ITAD_id(app_id)
+        current_price = None
+        next_sale = None
+        gap_days = None
+        if itad_id:
+            current_price = get_current_price(itad_id)
+            gap_days = average_gap_days(get_history(itad_id))
+            if gap_days is not None:
+                next_sale = datetime.now() + timedelta(days=gap_days)
+    except Exception:
+        logger.exception("last_sale failed for %s", app_id)
+        raise HTTPException(status_code=502, detail="Could not fetch price data")
+
+    # Cache "no data" results too, so unsupported games don't hit ITAD on every page load
+    try:
+        if cached_game:
+            cached_game.itad_id = itad_id
+            cached_game.last_checked = datetime.now()
+            cached_game.current_price = current_price
+            cached_game.average_gap_days = gap_days
+            cached_game.last_sale_date = next_sale
+        else:
+            db.add(Game(
+                app_id=app_id,
+                itad_id=itad_id,
+                last_checked=datetime.now(),
+                current_price=current_price,
+                average_gap_days=gap_days,
+                last_sale_date=next_sale,
+            ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("could not cache last_sale for %s", app_id)
+
+    return {"app_id": app_id, "prices": current_price, "next_sale": next_sale}
+
+
 def compute_features(app_id: int):
+    """Returns the model's feature list, or None if there isn't enough sale history."""
     itad_id = lookup_ITAD_id(app_id)
+    if itad_id is None:
+        return None
     hist = get_history(itad_id, since="2019-01-01T00:00:00Z")
-    num_sales = len(hist)
-    cuts = [event["deal"]["cut"] for event in hist]
-    avg_cut = sum(cuts) / len(cuts)
-    average_gap = timedelta()
     if len(hist) < 2:
-        raise ValueError("Not enough history to compute prediction")
-    for i in range(len(hist) - 1):
-        gap = datetime.fromisoformat(hist[i]["timestamp"]) - datetime.fromisoformat(hist[i + 1]["timestamp"])
-        average_gap += gap
-    avg_gap_days = average_gap.total_seconds() / 86400 / (len(hist) - 1)
+        return None
+
+    num_sales = len(hist)
+    avg_cut = sum(event["deal"]["cut"] for event in hist) / num_sales
+    avg_gap_days = average_gap_days(hist)
 
     most_recent_timestamp = datetime.fromisoformat(hist[0]["timestamp"])
-    days_since_last_sale = (datetime.now(most_recent_timestamp.tzinfo) - most_recent_timestamp).total_seconds() / 86400
+    days_since_last_sale = (
+        datetime.now(most_recent_timestamp.tzinfo) - most_recent_timestamp
+    ).total_seconds() / 86400
 
     regular_price = hist[0]["deal"]["regular"]["amount"]
     today = pd.Timestamp(datetime.now(), tz="UTC")
@@ -242,10 +293,15 @@ def compute_features(app_id: int):
 def predict(app_id: int):
     try:
         features = compute_features(app_id)
-        sale_prob = model.predict_proba([features])[0][1]
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=400, detail="Could not compute prediction")
+        if features is None:
+            return {"app_id": app_id, "sale_probability": None}  # not enough history
+        sale_prob = float(model.predict_proba([features])[0][1])
+    except requests.RequestException:
+        logger.exception("predict upstream failure for %s", app_id)
+        raise HTTPException(status_code=502, detail="Could not fetch sale data")
+    except Exception:
+        logger.exception("predict failed for %s", app_id)
+        raise HTTPException(status_code=500, detail="Could not compute prediction")
     return {"app_id": app_id, "sale_probability": sale_prob}
 
 
@@ -253,15 +309,17 @@ def predict(app_id: int):
 def get_price_history(app_id: int):
     try:
         itad_id = lookup_ITAD_id(app_id)
+        if itad_id is None:
+            return []
         hist = get_history(itad_id, since="2019-01-01T00:00:00Z")
-    except Exception as e:
-        print(e)
-        raise HTTPException(status_code=400, detail="Could not fetch price history")
+    except Exception:
+        logger.exception("history failed for %s", app_id)
+        raise HTTPException(status_code=502, detail="Could not fetch price history")
     return [
         {
             "timestamp": event["timestamp"],
             "cut": event["deal"]["cut"],
-            "regular_price": event["deal"]["regular"]["amount"]
+            "regular_price": event["deal"]["regular"]["amount"],
         }
         for event in hist
     ]
@@ -332,15 +390,8 @@ def get_community_rating(app_id: int, db: Session = Depends(get_db)):
         if status in counts:
             counts[status] = count
 
-    total = sum(counts.values())
-
     return {
         "app_id": app_id,
-        "total_votes": total,
+        "total_votes": sum(counts.values()),
         "counts": counts,
     }
-
-
-if __name__ == "__main__":
-    print(lookup_ITAD_id(1687950))
-    print(get_history("018d937f-4adb-73a6-a9e5-94ff62f6265b", since="2019-01-01T00:00:00Z"))

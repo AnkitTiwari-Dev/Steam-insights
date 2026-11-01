@@ -3,100 +3,148 @@ import { LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 import { Clock, ThumbsUp } from "lucide-react";
 import "./App.css";
 import RatingWidget from "./RatingWidget";
-const API_BASE = "https://playstats.onrender.com";
+
+// To test against a local backend, create .env.local with:
+//   VITE_API_URL=http://localhost:8000
+// and restart `npm run dev`. Without it, the deployed backend is used.
+const API_BASE = import.meta.env.VITE_API_URL ?? "https://playstats.onrender.com";
+
+// How many review_stats requests run at once. Steam's store API throttles
+// bursts, so keep this low.
+const RECOMMEND_CONCURRENCY = 3;
+
+// Fetch JSON from the backend. Returns null on any failure (network error,
+// non-2xx status, bad JSON) so callers never receive an error body by mistake.
+async function getJson(path) {
+  try {
+    const response = await fetch(`${API_BASE}${path}`);
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    console.error(`Request failed: ${path}`, e);
+    return null;
+  }
+}
+
+// Falls back to the wide header image when Steam has no tall library art.
+function coverStyle(appid) {
+  const base = `https://cdn.akamai.steamstatic.com/steam/apps/${appid}`;
+  return {
+    backgroundImage: `url(${base}/library_600x900.jpg), url(${base}/header.jpg)`,
+  };
+}
 
 function App() {
   const [user_ratings, set_user_ratings] = useState({});
   const [steam_id, set_steam_id] = useState("76561199570092491");
   const [library, set_library] = useState(null);
+  const [searching, set_searching] = useState(false);
+  const [search_error, set_search_error] = useState(null);
   const [selection, set_selection] = useState(null);
-  const [sale_info, change_sale_info] = useState(null);
-  const [prediction, set_prediction] = useState(null);
-  const [reviews, set_reviews] = useState(null);
-  const [history, set_history] = useState(null);
+
+  // For these four: undefined = still loading, null = failed / no data.
+  const [sale_info, change_sale_info] = useState(undefined);
+  const [prediction, set_prediction] = useState(undefined);
+  const [reviews, set_reviews] = useState(undefined);
+  const [history, set_history] = useState(undefined);
+
+  // recommend_data[appid]: undefined = loading, null = N/A, number = percent
   const [recommend_data, set_recommend_data] = useState({});
 
+  // Load everything for the selected game. The `cancelled` flag stops a slow
+  // response for a previous game from overwriting the current one.
   useEffect(() => {
     if (!selection) return;
+    let cancelled = false;
+    const appid = selection.appid;
 
-    async function fetchSale() {
-      const response = await fetch(`${API_BASE}/last_sale/${selection.appid}`);
-      const data = await response.json();
-      change_sale_info(data);
-    }
+    change_sale_info(undefined);
+    set_prediction(undefined);
+    set_reviews(undefined);
+    set_history(undefined);
 
-    async function fetchRating(){
-      const response = await fetch(`${API_BASE}/rating/${steam_id}`);
-      const data = await response.json();
-      set_user_ratings(data);
-    }
-    async function fetchPrediction() {
-      const response = await fetch(`${API_BASE}/predict/${selection.appid}`);
-      const data = await response.json();
-      set_prediction(data);
-    }
+    getJson(`/last_sale/${appid}`).then((d) => !cancelled && change_sale_info(d));
+    getJson(`/predict/${appid}`).then((d) => !cancelled && set_prediction(d));
+    getJson(`/reviews/${appid}`).then((d) => !cancelled && set_reviews(d));
+    getJson(`/history/${appid}`).then((d) => !cancelled && set_history(d));
+    // Note: the route is /ratings/ (plural) -- the old code called /rating/ and got a 404
+    getJson(`/ratings/${steam_id}`).then((d) => {
+      if (!cancelled && d) set_user_ratings(d);
+    });
 
-    async function fetchHistory() {
-      const response = await fetch(`${API_BASE}/history/${selection.appid}`);
-      if (!response.ok) {
-        set_history(null);
-        return;
-      }
-      const data = await response.json();
-      set_history(data);
-    }
-
-    async function fetchReviews() {
-      const response = await fetch(`${API_BASE}/reviews/${selection.appid}`);
-      const data = await response.json();
-      set_reviews(data);
-    }
-
-    fetchSale();
-    fetchPrediction();
-    fetchReviews();
-    fetchHistory();
-    fetchRating();
+    return () => {
+      cancelled = true;
+    };
   }, [selection]);
 
+  // Load review percentages for the library, a few at a time. Results appear
+  // on each card as they arrive instead of all at once at the end.
   useEffect(() => {
-  if (!library) return;
-
-  async function fetchAllRecommendations() {
-    const CONCURRENCY_LIMIT = 8;
+    if (!library?.games) return;
+    let cancelled = false;
     const games = library.games;
-    const results = {};
     let index = 0;
 
+    set_recommend_data({});
+
     async function worker() {
-      while (index < games.length) {
+      while (!cancelled && index < games.length) {
         const game = games[index];
         index++;
-        try {
-          const response = await fetch(`${API_BASE}/review_stats/${game.appid}`);
-          if (response.ok) {
-            const data = await response.json();
-            results[game.appid] = data.overall_percent;
-          }
-        } catch (e) {
-          console.error(`Failed to fetch review stats for ${game.appid}`, e);
-        }
+        const data = await getJson(`/review_stats/${game.appid}`);
+        if (cancelled) return;
+        const value = data?.overall_percent ?? null;
+        set_recommend_data((prev) => ({ ...prev, [game.appid]: value }));
       }
     }
 
-    const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
-    await Promise.all(workers);
-    set_recommend_data(results);
-  }
+    for (let i = 0; i < RECOMMEND_CONCURRENCY; i++) worker();
 
-  fetchAllRecommendations();
-}, [library]);
+    return () => {
+      cancelled = true;
+    };
+  }, [library]);
 
   async function lib_search() {
-    const response = await fetch(`${API_BASE}/library/${steam_id}`);
-    const data = await response.json();
-    set_library(data);
+    set_search_error(null);
+    set_searching(true);
+    try {
+      const response = await fetch(`${API_BASE}/library/${steam_id.trim()}`);
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        set_library(null);
+        set_search_error(
+          typeof data?.detail === "string"
+            ? data.detail
+            : "Could not load that library. Please try again."
+        );
+        return;
+      }
+      set_library(data);
+    } catch (e) {
+      console.error("Library search failed", e);
+      set_library(null);
+      set_search_error(
+        "Could not reach the server. It may be waking up, so try again in a few seconds."
+      );
+    } finally {
+      set_searching(false);
+    }
   }
+
+  const sale_text =
+    sale_info === undefined
+      ? "..."
+      : sale_info?.next_sale
+        ? new Date(sale_info.next_sale).toLocaleDateString()
+        : "N/A";
+
+  const prediction_text =
+    prediction === undefined
+      ? "..."
+      : prediction?.sale_probability != null
+        ? `${(prediction.sale_probability * 100).toFixed(0)}%`
+        : "N/A";
 
   return (
     /* Restored app-shell class so the background system and font stack activate */
@@ -116,9 +164,19 @@ function App() {
               onChange={(e) => set_steam_id(e.target.value)}
               placeholder="76561197960434622"
             />
-            <button onClick={lib_search}>Search</button>
+            <button onClick={lib_search} disabled={searching}>
+              {searching ? "Loading..." : "Search"}
+            </button>
 
-            {library && (
+            {searching && (
+              <p style={{ color: "#c7d5e0" }}>
+                Loading your library. If the server was asleep, the first load can take
+                up to 30 seconds.
+              </p>
+            )}
+            {search_error && <p style={{ color: "#e8a33d" }}>{search_error}</p>}
+
+            {library?.games && (
               <ul className="game-list">
                 {library.games.map((game) => (
                   <li
@@ -126,20 +184,23 @@ function App() {
                     className="game-card"
                     onClick={() => set_selection(game)}
                   >
-                    <div
-                      className="game-cover"
-                      style={{
-                        backgroundImage: `url(https://cdn.akamai.steamstatic.com/steam/apps/${game.appid}/library_600x900.jpg)`
-                    }}
-                    />
+                    <div className="game-cover" style={coverStyle(game.appid)} />
                     <div className="game-info">
                       <h4>{game.name}</h4>
                       <div className="game-stats-row">
-                        <p><Clock size={14} /> {(game.playtime_forever / 60).toFixed(1)} hours</p>
+                        <p>
+                          <Clock size={14} /> {(game.playtime_forever / 60).toFixed(1)} hours
+                        </p>
                         <p className="recommend-percent">
-                          {recommend_data[game.appid] != null
-                          ? <><ThumbsUp size={14} /> {recommend_data[game.appid]}%</>
-                          : "..."}
+                          {recommend_data[game.appid] === undefined ? (
+                            "..."
+                          ) : recommend_data[game.appid] === null ? (
+                            "N/A"
+                          ) : (
+                            <>
+                              <ThumbsUp size={14} /> {recommend_data[game.appid]}%
+                            </>
+                          )}
                         </p>
                       </div>
                     </div>
@@ -151,74 +212,89 @@ function App() {
         )}
 
         {selection && (
-  <div className="detail-view">
-    <button className="back-button" onClick={() => set_selection(null)}>
-      ← Back
-    </button>
+          <div className="detail-view">
+            <button className="back-button" onClick={() => set_selection(null)}>
+              ← Back
+            </button>
 
-    <div className="detail-header">
-      <div
-        className="detail-cover"
-        style={{
-          backgroundImage: `url(https://cdn.akamai.steamstatic.com/steam/apps/${selection.appid}/library_600x900.jpg)`
-        }}
-      />
-      <div className="detail-header-text">
-        <h2>{selection.name}</h2>
-          <RatingWidget
-          appId={selection.appid}
-          steamId={steam_id}
-          initialStatus={user_ratings[selection.appid]?.status}
-          initialScore={user_ratings[selection.appid]?.score}
-          />
-        <p className="detail-hours">{(selection.playtime_forever / 60).toFixed(1)} hours played</p>
-      </div>
-    </div>
-
-    <div className="stat-grid">
-      {sale_info && (
-        <div className="stat-card">
-          <p className="stat-label">Next sale estimate</p>
-          <p className="stat-value">{new Date(sale_info.next_sale).toLocaleDateString()}</p>
-        </div>
-      )}
-      {prediction && (
-        <div className="stat-card">
-          <p className="stat-label">Sale probability</p>
-          <p className="stat-value">{(prediction.sale_probability * 100).toFixed(0)}%</p>
-        </div>
-      )}
-    </div>
-
-    {history && (
-      <div className="detail-section">
-        <h3>Discount history</h3>
-        <LineChart width={600} height={260} data={[...history].reverse()}>
-          <XAxis dataKey="timestamp" tick={false} stroke="#2a2f3a" />
-          <YAxis dataKey="cut" tick={{ fill: "#8a8f98", fontSize: 12 }} stroke="#2a2f3a" />
-          <Tooltip
-            contentStyle={{ background: "#181b22", border: "1px solid #262a33", borderRadius: 8 }}
-            labelStyle={{ color: "#8a8f98" }}
-          />
-          <Line type="monotone" dataKey="cut" stroke="#e8a33d" strokeWidth={2} dot={false} />
-        </LineChart>
-      </div>
-    )}
-
-    {reviews && (
-      <div className="detail-section">
-        <h3>What experienced players think (30+ hours)</h3>
-        <div className="review-list">
-          {reviews.reviews.map((review, index) => (
-            <div className="review-card" key={index}>
-              <p>{review.review}</p>
+            <div className="detail-header">
+              <div className="detail-cover" style={coverStyle(selection.appid)} />
+              <div className="detail-header-text">
+                <h2>{selection.name}</h2>
+                <RatingWidget
+                  appId={selection.appid}
+                  steamId={steam_id}
+                  initialStatus={user_ratings[selection.appid]?.status}
+                  initialScore={user_ratings[selection.appid]?.score}
+                />
+                <p className="detail-hours">
+                  {(selection.playtime_forever / 60).toFixed(1)} hours played
+                </p>
+              </div>
             </div>
-          ))}
-        </div>
-      </div>
-    )}
-  </div>
-)}
+
+            <div className="stat-grid">
+              <div className="stat-card">
+                <p className="stat-label">Next sale estimate</p>
+                <p className="stat-value">{sale_text}</p>
+              </div>
+              <div className="stat-card">
+                <p className="stat-label">Sale probability</p>
+                <p className="stat-value">{prediction_text}</p>
+              </div>
+            </div>
+
+            <div className="detail-section">
+              <h3>Discount history</h3>
+              {history === undefined ? (
+                <p>Loading...</p>
+              ) : history?.length ? (
+                <LineChart width={600} height={260} data={[...history].reverse()}>
+                  <XAxis dataKey="timestamp" tick={false} stroke="#2a2f3a" />
+                  <YAxis
+                    dataKey="cut"
+                    tick={{ fill: "#8a8f98", fontSize: 12 }}
+                    stroke="#2a2f3a"
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#181b22",
+                      border: "1px solid #262a33",
+                      borderRadius: 8,
+                    }}
+                    labelStyle={{ color: "#8a8f98" }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="cut"
+                    stroke="#e8a33d"
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                </LineChart>
+              ) : (
+                <p>No discount history available for this game.</p>
+              )}
+            </div>
+
+            <div className="detail-section">
+              <h3>What experienced players think (30+ hours)</h3>
+              {reviews === undefined ? (
+                <p>Loading...</p>
+              ) : reviews?.reviews?.length ? (
+                <div className="review-list">
+                  {reviews.reviews.map((review, index) => (
+                    <div className="review-card" key={index}>
+                      <p>{review.review}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p>No reviews from 30+ hour players are available for this game.</p>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
